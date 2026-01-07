@@ -1,128 +1,205 @@
-// Package liveurls
-// @Time:2023/02/05 06:36
-// @File:douyu.go
-// @SoftWare:Goland
-// @Author:feiyang
-// @Contact:TG@feiyangdigital
-
 package liveurls
 
 import (
-	"Golang/utils"
+	"compress/flate"
+	"compress/gzip"
 	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Douyu struct {
-	Rid         string
-	Stream_type string
+	Rid         string // 房间号（短号）
+	Stream_type string // flv / hls / xs
+	Did         string // 设备ID
 }
 
-func md5V3(str string) string {
-	w := md5.New()
-	io.WriteString(w, str)
-	md5str := fmt.Sprintf("%x", w.Sum(nil))
-	return md5str
+type EncryptResp struct {
+	Error int `json:"error"`
+	Data  struct {
+		Key      string `json:"key"`
+		RandStr  string `json:"rand_str"`
+		Enc_data string `json:"enc_data"`
+		Enc_time int    `json:"enc_time"`
+	} `json:"data"`
+}
+type liveurl struct {
+	Error int `json:"error"`
+	Data  struct {
+		Rtmp_live string `json:"rtmp_live"`
+		Rtmp_url  string `json:"rtmp_url"`
+	} `json:"data"`
 }
 
-func (d *Douyu) GetRoomId() any {
-	liveurl := "https://m.douyu.com/" + d.Rid
-	client := &http.Client{}
-	r, _ := http.NewRequest("GET", liveurl, nil)
-	r.Header.Add("user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Mobile/15E148 Safari/604.1")
-	r.Header.Add("upgrade-insecure-requests", "1")
-	resp, _ := client.Do(r)
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	roomidreg := regexp.MustCompile(`(?i)rid":(\d{1,8}),"vipId`)
-	roomidres := roomidreg.FindStringSubmatch(string(body))
-	if roomidres == nil {
-		return nil
+func md5Hex(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+/* 获取真实房间号 */
+func (d *Douyu) GetRoomId() string {
+	u := "https://m.douyu.com/" + d.Rid
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X)")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
 	}
-	realroomid := roomidres[1]
-	return realroomid
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	reg := regexp.MustCompile(`rid":(\d+),`)
+	m := reg.FindStringSubmatch(string(body))
+	if len(m) < 2 {
+		return ""
+	}
+	fmt.Println("roomId:" + m[1])
+	return m[1]
 }
 
-func (d *Douyu) GetRealUrl() any {
-	var jsUtil = &utils.JsUtil{}
-	did := "10000000000000000000000000001501"
-	var timestamp = time.Now().Unix()
-	var realroomid string
+/* 获取加密参数 */
+func (d *Douyu) getEncryptInfo() (*EncryptResp, error) {
+	api := "https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did=" + d.Did
+
+	req, _ := http.NewRequest("GET", api, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Println("info:" + string(body))
+	var res EncryptResp
+	if err := json.Unmarshal(body, &res); err != nil {
+		return nil, err
+	}
+	if res.Error != 0 {
+		return nil, fmt.Errorf("getEncryption error")
+	}
+	return &res, nil
+}
+
+func calcAuth(
+	randStr string,
+	key string,
+	encTime int,
+	rid string,
+	tt int64,
+) string {
+
+	u := randStr
+	for i := 0; i < encTime; i++ {
+		u = md5Hex(u + key)
+	}
+	u = md5Hex(u + key + rid + strconv.FormatInt(tt, 10))
+	return u
+}
+
+/* 获取真实播放地址 */
+func (d *Douyu) GetRealUrl() string {
+	// 1. real rid
 	rid := d.GetRoomId()
-	if str, ok := rid.(string); ok {
-		realroomid = str
-	} else {
-		return nil
+	if rid == "" {
+		return ""
 	}
-	liveurl := "https://www.douyu.com/" + realroomid
-	client := &http.Client{}
-	r, _ := http.NewRequest("GET", liveurl, nil)
-	r.Header.Add("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-	r.Header.Add("upgrade-insecure-requests", "1")
-	resp, _ := client.Do(r)
+
+	// 2. encrypt info
+	enc, err := d.getEncryptInfo()
+	if err != nil {
+		return ""
+	}
+
+	// 3. sign
+	tt := time.Now().Unix()
+	key := enc.Data.Key
+	randStr := enc.Data.RandStr
+	enc_data := enc.Data.Enc_data
+	enc_time := enc.Data.Enc_time
+	auth := calcAuth(randStr, key, enc_time, rid, tt)
+
+	// 4. POST 请求
+	form := url.Values{}
+	form.Set("rid", rid)
+	form.Set("did", d.Did)
+	form.Set("tt", strconv.FormatInt(tt, 10))
+	form.Set("auth", auth)
+	form.Set("enc_data", enc_data)
+	form.Set("cdn", "")
+	form.Set("rate", "0") // 必须 -1 避免 WAF 拦截
+	form.Set("hevc", "0")
+	form.Set("fa", "0")
+	form.Set("ive", "0")
+	fmt.Println("form:" + form.Encode())
+	api := "https://www.douyu.com/lapi/live/getH5PlayV1/" + rid
+	req, _ := http.NewRequest("POST", api, strings.NewReader(form.Encode()))
+	req.Header.Set("Host", "www.douyu.com")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://www.douyu.com")
+	req.Header.Set("Referer", "https://www.douyu.com/"+rid)
+	req.Header.Set("Connection", "keep-alive")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	reg := regexp.MustCompile(`(?i)(vdwdae325w_64we[\s\S]*function ub98484234[\s\S]*?)function`)
-	res := reg.FindStringSubmatch(string(body))
-	nreg := regexp.MustCompile(`(?i)eval.*?;}`)
-	strfn := nreg.ReplaceAllString(res[1], "strc;}")
-	var funcContent1 []string
-	funcContent1 = append(append(funcContent1, strfn), "ub98484234")
-	result := jsUtil.JsRun(funcContent1, "ub98484234")
-	nres := fmt.Sprintf("%s", result)
-	nnreg := regexp.MustCompile(`(?i)v=(\d+)`)
-	nnres := nnreg.FindStringSubmatch(nres)
-	unrb := fmt.Sprintf("%v%v%v%v", realroomid, did, timestamp, nnres[1])
-	rb := md5V3(unrb)
-	nnnreg := regexp.MustCompile(`(?i)return rt;}\);?`)
-	strfn2 := nnnreg.ReplaceAllString(nres, "return rt;}")
-	strfn3 := strings.Replace(strfn2, `(function (`, `function sign(`, -1)
-	strfn4 := strings.Replace(strfn3, `CryptoJS.MD5(cb).toString()`, `"`+rb+`"`, -1)
-	var funcContent2 []string
-	funcContent2 = append(append(funcContent2, strfn4), "sign")
-	result2 := jsUtil.JsRun(funcContent2, realroomid, did, timestamp)
-	param := fmt.Sprintf("%s", result2)
-	realparam := param + "&rate=0"
-	r1, n4err := http.Post("https://www.douyu.com/lapi/live/getH5Play/"+realroomid, "application/x-www-form-urlencoded", strings.NewReader(realparam))
-	if n4err != nil {
-		return nil
-	}
-	defer r1.Body.Close()
-	body1, _ := io.ReadAll(r1.Body)
-	var s1 map[string]any
-	json.Unmarshal(body1, &s1)
-	var flv_url string
-	var rtmp_url string
-	var rtmp_live string
-	for k, v := range s1 {
-		if k == "error" {
-			if s1[k] != float64(0) {
-				return nil
-			}
+	var reader io.Reader = resp.Body
+	switch resp.Header.Get("Content-Encoding") {
+	case "gzip":
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return ""
 		}
-		if v, ok := v.(map[string]any); ok {
-			for k, v := range v {
-				if k == "rtmp_url" {
-					if urlstr, ok := v.(string); ok {
-						rtmp_url = urlstr
-					}
-				} else if k == "rtmp_live" {
-					if urlstr, ok := v.(string); ok {
-						rtmp_live = urlstr
-					}
-				}
-			}
-		}
+		defer gz.Close()
+		reader = gz
+
+	case "deflate":
+		fr := flate.NewReader(resp.Body)
+		defer fr.Close()
+		reader = fr
 	}
-	flv_url = rtmp_url + "/" + rtmp_live
-	n4reg := regexp.MustCompile(`(?i)(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}(.flv|/playlist)`)
+
+	body, _ := io.ReadAll(reader)
+	fmt.Println("body:" + string(body))
+	var live liveurl
+	if err := json.Unmarshal(body, &live); err != nil {
+		return ""
+	}
+	if live.Error != 0 {
+		return ""
+	}
+
+	var rtmp_url, rtmp_live string
+
+	rtmp_url = live.Data.Rtmp_url
+	rtmp_live = live.Data.Rtmp_live
+
+	// 5. 解析 flv_url
+	flv_url := rtmp_url + "/" + rtmp_live
+	fmt.Println("flv_url:" + flv_url)
+	// 安全正则匹配
+	n4reg := regexp.MustCompile(`(?i)(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}(\.flv|/playlist)`)
 	houzhui := n4reg.FindStringSubmatch(flv_url)
+	if len(houzhui) < 2 {
+		return flv_url
+	}
+
 	var real_url string
 	switch d.Stream_type {
 	case "hls":
@@ -131,6 +208,9 @@ func (d *Douyu) GetRealUrl() any {
 		real_url = flv_url
 	case "xs":
 		real_url = strings.Replace(flv_url, houzhui[1]+".flv", houzhui[1]+".xs", -1)
+	default:
+		real_url = flv_url
 	}
+
 	return real_url
 }
